@@ -30,12 +30,16 @@ export type DeliveryLogInput = {
   comments: string;
   deliveryFrom: string;
   trackingNumber: string;
+  timeHour: number;
+  timeMinute: number;
+  uploadIds?: string[];
   vendorId?: string;
   locationId?: string;
 };
 export type DeliveryLog = DeliveryLogInput & {
   id: string;
   status: string | null;
+  attachments: { id: string; name: string; uploadId: string | null }[];
 };
 const object = (v: unknown): Record<string, unknown> => {
   if (!v || typeof v !== "object" || Array.isArray(v))
@@ -84,6 +88,34 @@ const contract = (v: unknown): Contract => {
     type: nullable(r.type),
   };
 };
+const uploadId = (v: unknown): string => {
+  if (
+    typeof v !== "string" ||
+    !(/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(v) || /^[a-f0-9-]{36}$/i.test(v))
+  )
+    throw new ProcoreError("INVALID_UPLOAD_ID");
+  return v;
+};
+const clockPart = (v: unknown, max: number): number => {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > max)
+    throw new ProcoreError("INVALID_TIME");
+  return v;
+};
+const attachments = (v: unknown) => {
+  if (v == null) return [];
+  if (!Array.isArray(v) || v.length > 100)
+    throw new ProcoreError("INVALID_ATTACHMENTS");
+  return v.map((item) => {
+    const a = object(item);
+    let uuid: string | null = null;
+    try {
+      uuid = uploadId(
+        new URL(text(a.url)).pathname.split("/").filter(Boolean).at(-1),
+      );
+    } catch {}
+    return { id: id(a.id), name: text(a.name ?? a.filename), uploadId: uuid };
+  });
+};
 const log = (v: unknown): DeliveryLog => {
   const r = object(v);
   return {
@@ -94,6 +126,9 @@ const log = (v: unknown): DeliveryLog => {
     deliveryFrom: text(r.delivery_from ?? ""),
     trackingNumber: text(r.tracking_number ?? ""),
     status: nullable(r.status),
+    timeHour: clockPart(r.time_hour, 23),
+    timeMinute: clockPart(r.time_minute, 59),
+    attachments: attachments(r.attachments),
     ...(r.vendor ? { vendorId: id(object(r.vendor).id) } : {}),
     ...(r.location ? { locationId: id(object(r.location).id) } : {}),
   };
@@ -119,9 +154,19 @@ export function deliveryLogPayload(input: DeliveryLogInput) {
   }
   if (!input.contents.trim() || !input.trackingNumber.trim())
     throw new ProcoreError("INVALID_INPUT");
+  if (
+    input.uploadIds &&
+    (!Array.isArray(input.uploadIds) ||
+      input.uploadIds.length > 10 ||
+      new Set(input.uploadIds).size !== input.uploadIds.length)
+  )
+    throw new ProcoreError("INVALID_UPLOADS");
   return {
     delivery_log: {
       date: date(input.date),
+      time_hour: clockPart(input.timeHour, 23),
+      time_minute: clockPart(input.timeMinute, 59),
+      ...(input.uploadIds ? { upload_ids: input.uploadIds.map(uploadId) } : {}),
       contents: input.contents,
       comments: input.comments,
       delivery_from: input.deliveryFrom,
@@ -133,6 +178,7 @@ export function deliveryLogPayload(input: DeliveryLogInput) {
 }
 export type ProcoreOptions = {
   environment: ProcoreEnvironment;
+  signal?: AbortSignal;
   accessToken: () => Promise<string>;
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   timeoutMs?: number;
@@ -159,7 +205,9 @@ export function createProcoreClient(options: ProcoreOptions) {
     companyId: string | undefined,
     body?: unknown,
   ) {
+    options.signal?.throwIfAborted();
     const token = await options.accessToken();
+    options.signal?.throwIfAborted();
     if (!token || /[\r\n]/.test(token)) throw new ProcoreError("INVALID_TOKEN");
     const controller = new AbortController(),
       timer = setTimeout(() => controller.abort(), timeout);
@@ -168,7 +216,9 @@ export function createProcoreClient(options: ProcoreOptions) {
       const r = await (options.fetch ?? globalThis.fetch)(origin + path, {
         method: write ? "POST" : "GET",
         redirect: "error",
-        signal: controller.signal,
+        signal: options.signal
+          ? AbortSignal.any([controller.signal, options.signal])
+          : controller.signal,
         headers: {
           Authorization: "Bearer " + token,
           Accept: "application/json",
@@ -271,6 +321,93 @@ export function createProcoreClient(options: ProcoreOptions) {
     throw new ProcoreError("PAGE_LIMIT");
   }
   return {
+    uploadFile: async (
+      companyId: string,
+      projectId: string,
+      file: { name: string; contentType: string; bytes: Uint8Array },
+    ) => {
+      const company = id(companyId),
+        project = id(projectId);
+      if (
+        !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,179}$/.test(file.name) ||
+        !["application/pdf", "image/jpeg", "image/png", "text/plain"].includes(
+          file.contentType,
+        ) ||
+        !file.bytes.byteLength ||
+        file.bytes.byteLength > 2097152
+      )
+        throw new ProcoreError("INVALID_FILE");
+      const result = object(
+        (
+          await request(`/rest/v1.1/projects/${project}/uploads`, company, {
+            response_filename: file.name,
+            response_content_type: file.contentType,
+            attachment_content_disposition: true,
+            size: file.bytes.byteLength,
+          })
+        ).value,
+      );
+      const uuid = uploadId(result.uuid),
+        url = new URL(text(result.url));
+      // Procore's direct upload response authorizes this S3 destination. Never
+      // forward OAuth credentials, accept redirects or contact arbitrary hosts.
+      if (
+        url.protocol !== "https:" ||
+        url.username ||
+        url.password ||
+        url.port ||
+        !/^([a-z0-9.-]+\.)?s3([.-][a-z0-9-]+)?\.amazonaws\.com$/.test(
+          url.hostname,
+        )
+      )
+        throw new ProcoreError("UNSAFE_UPLOAD_DESTINATION");
+      const fields = object(result.fields),
+        entries = Object.entries(fields);
+      if (entries.length > 40) throw new ProcoreError("INVALID_UPLOAD_FIELDS");
+      const form = new FormData();
+      for (const [k, v] of entries) {
+        if (
+          !k ||
+          k.length > 150 ||
+          k.toLowerCase() === "file" ||
+          typeof v !== "string" ||
+          v.length > 20000
+        )
+          throw new ProcoreError("INVALID_UPLOAD_FIELDS");
+        form.append(k, v);
+      }
+      form.append(
+        "file",
+        new Blob([new Uint8Array(file.bytes)], { type: file.contentType }),
+        file.name,
+      );
+      const controller = new AbortController(),
+        timer = setTimeout(() => controller.abort(), timeout);
+      try {
+        options.signal?.throwIfAborted();
+        const response = await (options.fetch ?? globalThis.fetch)(url, {
+          method: "POST",
+          body: form,
+          redirect: "error",
+          signal: options.signal
+            ? AbortSignal.any([controller.signal, options.signal])
+            : controller.signal,
+        });
+        await response.body?.cancel();
+        if (!response.ok)
+          throw new ProcoreError(
+            "UPLOAD_HTTP_" + response.status,
+            "unknown",
+            response.status,
+          );
+        return { id: uuid };
+      } catch (e) {
+        if (e instanceof ProcoreError) throw e;
+        throw new ProcoreError("UPLOAD_UNAVAILABLE", "unknown");
+      } finally {
+        clearTimeout(timer);
+      }
+    },
     companies: () =>
       list("/rest/v1.0/companies", undefined, { view: "compact" }, reference),
     projects: (companyId: string) =>

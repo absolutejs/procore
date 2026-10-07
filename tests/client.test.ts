@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { createProcoreClient, ProcoreError, deliveryLogPayload } from "../src";
 const input = {
+  timeHour: 10,
+  timeMinute: 25,
   date: "2026-10-07",
   contents: "4.5 short tons of stone",
   comments: "Reviewed delivery",
@@ -177,4 +179,88 @@ test("bounds response size and rejects malformed JSON without exposing content",
   await expect(
     client(async () => new Response("secret malformed data")).companies(),
   ).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+});
+test("direct upload sends bytes and signed fields without forwarding OAuth credentials", async () => {
+  const uuid = "01FZ8QATJYD0K7BZG2PP5GB4KN";
+  let calls = 0;
+  const c = client(async (url, init) => {
+    calls++;
+    if (calls === 1) {
+      expect(new Headers(init?.headers).get("Authorization")).toBe(
+        "Bearer private-token",
+      );
+      expect(JSON.parse(String(init?.body)).response_filename).toBe(
+        "ticket.txt",
+      );
+      return reply({
+        uuid,
+        url: "https://procore-uploads.s3.amazonaws.com",
+        fields: { key: "companies/42/" + uuid, policy: "signed-policy" },
+      });
+    }
+    expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+    expect(init?.redirect).toBe("error");
+    const form = init?.body as FormData;
+    expect(form.get("policy")).toBe("signed-policy");
+    expect(await (form.get("file") as Blob).text()).toBe("ticket");
+    return new Response(null, { status: 204 });
+  });
+  expect(
+    await c.uploadFile("42", "13", {
+      name: "ticket.txt",
+      contentType: "text/plain",
+      bytes: new TextEncoder().encode("ticket"),
+    }),
+  ).toEqual({ id: uuid });
+  expect(calls).toBe(2);
+});
+test("upload rejects arbitrary destinations and aborted clients never send bytes", async () => {
+  let calls = 0;
+  const c = client(async () => {
+    calls++;
+    return reply({
+      uuid: "01FZ8QATJYD0K7BZG2PP5GB4KN",
+      url: "https://localhost/private",
+      fields: {},
+    });
+  });
+  await expect(
+    c.uploadFile("42", "13", {
+      name: "x.txt",
+      contentType: "text/plain",
+      bytes: new Uint8Array([1]),
+    }),
+  ).rejects.toMatchObject({ code: "UNSAFE_UPLOAD_DESTINATION" });
+  expect(calls).toBe(1);
+  const abort = new AbortController();
+  abort.abort();
+  await expect(
+    client(
+      async () => {
+        throw new Error("must not send");
+      },
+      { signal: abort.signal },
+    ).createDeliveryLog("42", "13", input),
+  ).rejects.toThrow();
+  expect(() => deliveryLogPayload({ ...input, timeHour: 24 })).toThrow();
+});
+test("attachment receipts retain upload identity without exposing signed download URLs", async () => {
+  const uuid = "01FZ8QATJYD0K7BZG2PP5GB4KN";
+  const r = await client(async () =>
+    reply({
+      id: 99,
+      ...deliveryLogPayload(input).delivery_log,
+      attachments: [
+        {
+          id: 8,
+          name: "ticket.txt",
+          url: "https://storage.procore.com/files/" + uuid + "?sig=private",
+        },
+      ],
+    }),
+  ).deliveryLog("42", "13", "99");
+  expect(r.attachments).toEqual([
+    { id: "8", name: "ticket.txt", uploadId: uuid },
+  ]);
+  expect(JSON.stringify(r)).not.toContain("private");
 });
